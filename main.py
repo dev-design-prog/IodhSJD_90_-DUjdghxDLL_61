@@ -43,9 +43,9 @@ from telethon.sessions import StringSession
 
 # ============================== НАСТРОЙКИ ==============================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9045800147:AAGF62Q0ODbmaemIyQXUBDBD2swemnnM-Rs").strip()
-API_ID = int(os.environ.get("API_ID", "20283675") or 0)
-API_HASH = os.environ.get("API_HASH", "62273acc88d8400298b93b1b95bed2d4").strip()
-OWNER_ID = int(os.environ.get("OWNER_ID", "806669429") or 0)
+API_ID = int(os.environ.get("API_ID", "30747671") or 0)
+API_HASH = os.environ.get("API_HASH", "bdcf76d5a8d81fe75e0d211c0d3d7826").strip()
+OWNER_ID = int(os.environ.get("OWNER_ID", "315077220") or 0)
 SESSION_STRING = os.environ.get("SESSION_STRING", "").strip()
 PORT = int(os.environ.get("PORT", "10000"))
 
