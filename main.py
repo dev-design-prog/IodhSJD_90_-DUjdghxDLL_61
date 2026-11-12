@@ -25,6 +25,7 @@ import os
 import random
 import re
 import time
+import traceback
 from contextlib import suppress
 from functools import partial
 from pathlib import Path
@@ -44,7 +45,8 @@ from telethon import TelegramClient, errors, events
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import Channel, Chat
+from telethon.tl.types import (Channel, Chat, DocumentAttributeAnimated, DocumentAttributeVideo,
+                               MessageEntityMention, MessageEntityMentionName)
 
 # ============================== НАСТРОЙКИ ==============================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9045800147:AAGF62Q0ODbmaemIyQXUBDBD2swemnnM-Rs").strip()
@@ -64,6 +66,7 @@ CAPTION_LIMIT = 1024                # лимит подписи к фото; д�
 
 # --- автоподписка ---
 AUTOSUB_ONLY_ADDRESSED = True       # True: подписываться, только если бот обратился к вам (упомянул или ответил на ваше сообщение)
+AUTOSUB_DEBUG = True                # True: если сообщение бота похоже на «подпишитесь», но подписки не было - бот пришлёт в лс причину
 MAX_JOINS_PER_DAY = 20              # защита от лимитов Telegram: не больше N вступлений за сутки
 JOIN_PAUSE = (5, 12)                # случайная пауза перед каждым вступлением, сек
 
@@ -317,22 +320,46 @@ async def spam_unblock():
 
 
 # ============================== ФОТО ДЛЯ РАССЫЛКИ ==============================
-async def upload_photo(bot: Bot, photo_size) -> bool:
-    """Скачивает фото от бота и кладёт в «Избранное» аккаунта. Оттуда оно берётся при каждой рассылке."""
+MAX_BOT_DOWNLOAD = 20 * 1024 * 1024   # лимит Bot API: бот может скачать файл не больше 20 МБ
+
+
+async def upload_media(bot: Bot, m: Message) -> str | None:
+    """Кладёт фото / видео / GIF / файл из сообщения в «Избранное» аккаунта - оттуда оно берётся при каждой рассылке.
+    Возвращает None при успехе, иначе текст ошибки."""
     if not await is_connected():
-        return False
-    bio = io.BytesIO()
-    await bot.download(photo_size, destination=bio)
-    bio.seek(0)
-    bio.name = "mailing.jpg"
-    msg = await tg.send_file("me", bio, caption=PHOTO_TAG, silent=True, force_document=False)
+        return "Аккаунт не подключен."
+    attrs, force_doc = [], False
+    if m.photo:
+        obj, name = m.photo[-1], "mailing.jpg"
+    elif m.video:
+        obj, name = m.video, m.video.file_name or "mailing.mp4"
+        attrs = [DocumentAttributeVideo(duration=obj.duration, w=obj.width, h=obj.height, supports_streaming=True)]
+    elif m.animation:   # GIF (проверяем раньше document: у анимации заполнены оба поля)
+        obj, name = m.animation, m.animation.file_name or "mailing.mp4"
+        attrs = [DocumentAttributeVideo(duration=obj.duration, w=obj.width, h=obj.height, supports_streaming=True),
+                 DocumentAttributeAnimated()]
+    elif m.document:
+        obj, name, force_doc = m.document, m.document.file_name or "file", True
+    else:
+        return "Такой тип вложения не поддерживается. Нужно фото, видео, GIF или файл."
+    if (obj.file_size or 0) > MAX_BOT_DOWNLOAD:
+        return "Файл больше 20 МБ - бот не может его скачать. Пришлите файл поменьше."
+    try:
+        bio = io.BytesIO()
+        await bot.download(obj, destination=bio)
+        bio.seek(0)
+        bio.name = name
+        msg = await tg.send_file("me", bio, caption=PHOTO_TAG, silent=True,
+                                 force_document=force_doc, attributes=attrs or None)
+    except Exception as e:  # noqa: BLE001
+        return f"Не удалось загрузить вложение: {html.escape(str(e)[:150])}"
     old = cfg.get("photo_msg_id")
     cfg["photo_msg_id"] = msg.id
     save_cfg()
     if old:
         with suppress(Exception):
             await tg.delete_messages("me", [old])
-    return True
+    return None
 
 
 async def remove_photo() -> None:
@@ -426,33 +453,90 @@ async def join_target(tag: str):
         return "fail", str(e)[:80]
 
 
+_me = None
+_handled: set = set()       # (чат, id сообщения) - чтобы не обрабатывать одно сообщение дважды (новое + правка)
+_last_debug: dict = {}      # чат -> время последнего диагностического уведомления
+
+
+async def _get_me():
+    global _me
+    if _me is None:
+        _me = await tg.get_me()
+    return _me
+
+
+async def _is_addressed(msg) -> bool:
+    """Бот обратился именно к вам: упоминание, ответ на ваше сообщение (даже уже удалённое ботом) или ваше имя в тексте."""
+    if msg.mentioned:
+        return True
+    me = await _get_me()
+    uname = (me.username or "").lower()
+    with suppress(Exception):
+        for ent, txt in msg.get_entities_text():
+            if isinstance(ent, MessageEntityMentionName) and ent.user_id == me.id:
+                return True
+            if isinstance(ent, MessageEntityMention) and uname and txt.lower() == "@" + uname:
+                return True
+    low = (msg.raw_text or "").lower()
+    if uname and "@" + uname in low:
+        return True
+    if me.first_name and len(me.first_name) >= 3 and me.first_name.lower() in low:
+        return True
+    if msg.is_reply:
+        reply = None
+        with suppress(Exception):
+            reply = await msg.get_reply_message()
+        # reply is None - ваше сообщение бот уже удалил (типично для ботов-«подписчиков»), считаем, что ответ вам
+        return reply is None or bool(reply.out)
+    return False
+
+
+async def _skip(bot: Bot, cid: str, why: str, msg) -> None:
+    print(f"[autosub] пропуск ({why}): чат {cid}, сообщение {msg.id}")
+    if not AUTOSUB_DEBUG:
+        return
+    now = time.time()
+    if now - _last_debug.get(cid, 0) < 120:
+        return
+    _last_debug[cid] = now
+    name = html.escape(cfg["chats"].get(cid, cid))
+    await notify(bot, f"🔕 Автоподписка не сработала в чате «{name}»: {why}.\n\n"
+                      f"Сообщение бота:\n{html.escape((msg.raw_text or '')[:300])}")
+
+
 async def _autosub(bot: Bot, event) -> None:
     if not cfg.get("autosub") or not event.is_group:
         return
     cid = str(event.chat_id)
     if cid not in cfg["selected"]:          # только чаты из вашей рассылки
         return
+    msg = event.message
+    key = (cid, msg.id)
+    if key in _handled:
+        return
     sender = await event.get_sender()
     if not getattr(sender, "bot", False):   # только сообщения ботов
         return
-    msg = event.message
-
-    if AUTOSUB_ONLY_ADDRESSED and not msg.mentioned:
-        reply = await msg.get_reply_message() if msg.is_reply else None
-        if not (reply and reply.out):
-            return
 
     tags, buttons = await extract_targets(msg)
+    looks_sub = SUB_RE.search((msg.raw_text or "") + " " + " ".join((b.text or "") for b in buttons))
+    if not looks_sub:
+        return
+    if AUTOSUB_ONLY_ADDRESSED and not await _is_addressed(msg):
+        return await _skip(bot, cid, "сообщение не адресовано вам (бот не упомянул вас и не ответил вам)", msg)
     if not tags:
-        return
-    if not SUB_RE.search((msg.raw_text or "") + " " + " ".join(b.text for b in buttons)):
-        return
+        return await _skip(bot, cid, "не нашёл в сообщении ссылку или @юзернейм канала", msg)
+
+    if len(_handled) > 2000:
+        _handled.clear()
+    _handled.add(key)
+    print(f"[autosub] обрабатываю: чат {cid}, цели {tags}")
 
     results, ok_any = [], False
     async with _join_lock:
         for tag in tags:
-            key = tag.lower()
-            if key in _joined_tags:
+            k = tag.lower()
+            if k in _joined_tags:
                 ok_any = True
                 continue
             now = time.time()
@@ -465,7 +549,7 @@ async def _autosub(bot: Bot, event) -> None:
                 continue
             if status in ("joined", "already"):
                 ok_any = True
-                _joined_tags.add(key)
+                _joined_tags.add(k)
                 if status == "joined":
                     _join_times.append(time.time())
             results.append(f"• {html.escape(tag)}: {html.escape(info)}")
@@ -495,6 +579,7 @@ async def on_group_message(bot: Bot, event) -> None:
         await _autosub(bot, event)
     except Exception as e:  # noqa: BLE001
         print("Автоподписка, ошибка:", e)
+        traceback.print_exc()
 
 
 # ============================== РАССЫЛКА ==============================
@@ -655,7 +740,7 @@ def settings_view():
         "<b>Настройка рассылки</b>\n\n"
         f"💬 Чатов выбрано: <b>{len(cfg['selected'])}</b> из {len(cfg['chats'])}\n"
         f"📝 Текст: {prev}\n"
-        f"🖼 Фото: <b>{'есть' if has_photo else 'нет'}</b>\n"
+        f"🖼 Медиа (фото/видео/GIF/файл): <b>{'есть' if has_photo else 'нет'}</b>\n"
         f"⏱ Интервал между раундами: <b>{fmt_duration(cfg['interval'])}</b>\n"
         f"🔁 Повторов (раундов): <b>{cfg['count'] or '∞'}</b>\n"
         f"⏳ Пауза между чатами: <b>{fmt_duration(cfg['chat_pause'])}</b>\n"
@@ -664,7 +749,7 @@ def settings_view():
     kb = kb_of([
         [("💬 Выбор чатов", "ch:p:0")],
         [("📝 Текст", "set:text")],
-        [("🖼 Фото", "set:photo")] + ([("🗑 Убрать фото", "del:photo")] if has_photo else []),
+        [("🖼 Медиа", "set:photo")] + ([("🗑 Убрать медиа", "del:photo")] if has_photo else []),
         [("⏱ Интервал", "set:interval"), ("🔁 Повторы", "set:count")],
         [("⏳ Пауза между чатами", "set:pause")],
         [(f"🔔 Автоподписка: {'ВКЛ' if sub_on else 'ВЫКЛ'}", "toggle:autosub")],
@@ -864,7 +949,7 @@ async def cb_set_text(cb: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "set:photo")
 async def cb_set_photo(cb: CallbackQuery, state: FSMContext):
     await ask(cb, state, Form.photo,
-              "Отправьте фото для рассылки (именно как фото, не файлом). "
+              "Отправьте фото, видео, GIF или файл для рассылки (до 20 МБ). "
               "Текст рассылки уйдёт подписью к нему.")
 
 
@@ -910,32 +995,34 @@ async def back_to_settings(m: Message, state: FSMContext):
 
 @router.message(Form.text)
 async def st_text(m: Message, state: FSMContext):
-    if m.photo:   # фото с подписью: ставим и фото, и текст (если подпись есть)
-        if not await upload_photo(m.bot, m.photo[-1]):
-            return await m.answer("Не удалось загрузить фото. Проверьте, что аккаунт подключен.")
+    if m.photo or m.video or m.animation or m.document:   # вложение с подписью: ставим и медиа, и текст (если подпись есть)
+        err = await upload_media(m.bot, m)
+        if err:
+            return await m.answer(err)
         if m.caption:
             cfg["text"] = m.html_text
             cfg["text_plain"] = m.caption
             save_cfg()
         return await back_to_settings(m, state)
     if not m.text:
-        return await m.answer("Нужно текстовое сообщение (или фото с подписью).")
+        return await m.answer("Нужен текст или фото / видео / GIF / файл (можно с подписью).")
     cfg["text"] = m.html_text
     cfg["text_plain"] = m.text
     save_cfg()
     await back_to_settings(m, state)
 
 
-@router.message(Form.photo, F.photo)
+@router.message(Form.photo, F.photo | F.video | F.animation | F.document)
 async def st_photo(m: Message, state: FSMContext):
-    if not await upload_photo(m.bot, m.photo[-1]):
-        return await m.answer("Не удалось загрузить фото. Проверьте, что аккаунт подключен.")
+    err = await upload_media(m.bot, m)
+    if err:
+        return await m.answer(err)
     await back_to_settings(m, state)
 
 
 @router.message(Form.photo)
 async def st_photo_bad(m: Message):
-    await m.answer("Нужно именно фото (не файл и не текст). Отправьте картинку ещё раз.")
+    await m.answer("Нужно фото, видео, GIF или файл. Отправьте вложение ещё раз.")
 
 
 @router.message(Form.interval)
@@ -1044,7 +1131,9 @@ async def main():
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
-    tg.add_event_handler(partial(on_group_message, bot), events.NewMessage(incoming=True))
+    handler = partial(on_group_message, bot)
+    tg.add_event_handler(handler, events.NewMessage(incoming=True))
+    tg.add_event_handler(handler, events.MessageEdited(incoming=True))   # боты часто дописывают кнопки правкой
 
     await tg.connect()
     if await tg.is_user_authorized():
