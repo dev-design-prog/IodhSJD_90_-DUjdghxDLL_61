@@ -22,9 +22,11 @@ import html
 import io
 import json
 import os
+import random
 import re
 import time
 from contextlib import suppress
+from functools import partial
 from pathlib import Path
 
 from aiohttp import web
@@ -38,8 +40,11 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
-from telethon import TelegramClient, errors
+from telethon import TelegramClient, errors, events
 from telethon.sessions import StringSession
+from telethon.tl.functions.channels import JoinChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.types import Channel, Chat
 
 # ============================== НАСТРОЙКИ ==============================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "9045800147:AAGF62Q0ODbmaemIyQXUBDBD2swemnnM-Rs").strip()
@@ -53,6 +58,14 @@ CONFIG_FILE = Path("data.json")     # локальная копия (на Render
 CONFIG_TAG = "MAILBOT_CONFIG"       # метка сообщения с настройками в «Избранном»
 MIN_INTERVAL = 10                   # минимальный интервал между раундами, сек
 CHATS_PER_PAGE = 8
+
+PHOTO_TAG = "MAILBOT_PHOTO"        # метка сообщения с фото рассылки в «Избранном»
+CAPTION_LIMIT = 1024                # лимит подписи к фото; длиннее - фото и текст уйдут двумя сообщениями
+
+# --- автоподписка ---
+AUTOSUB_ONLY_ADDRESSED = True       # True: подписываться, только если бот обратился к вам (упомянул или ответил на ваше сообщение)
+MAX_JOINS_PER_DAY = 20              # защита от лимитов Telegram: не больше N вступлений за сутки
+JOIN_PAUSE = (5, 12)                # случайная пауза перед каждым вступлением, сек
 
 # Текст, который уйдёт в @SpamBot, если он попросит объяснение
 APPEAL_TEXT = (
@@ -85,8 +98,11 @@ DEFAULT_CFG = {
     "chat_pause": 5,      # пауза между чатами внутри раунда, сек
     "running": False,     # идёт ли рассылка (нужно для автопродолжения)
     "done": 0,            # сколько раундов уже выполнено
+    "photo_msg_id": None, # id сообщения с фото в «Избранном» (None = без фото)
+    "autosub": True,     # автоподписка на каналы, которые просят боты в группах
 }
-PERSIST_KEYS = ["selected", "text", "text_plain", "interval", "count", "chat_pause", "running", "done"]
+PERSIST_KEYS = ["selected", "text", "text_plain", "interval", "count", "chat_pause", "running", "done",
+                "photo_msg_id", "autosub"]
 
 
 def load_cfg() -> dict:
@@ -154,6 +170,7 @@ class Form(StatesGroup):
     code = State()
     password = State()
     text = State()
+    photo = State()
     interval = State()
     count = State()
     pause = State()
@@ -299,6 +316,187 @@ async def spam_unblock():
     return False, log
 
 
+# ============================== ФОТО ДЛЯ РАССЫЛКИ ==============================
+async def upload_photo(bot: Bot, photo_size) -> bool:
+    """Скачивает фото от бота и кладёт в «Избранное» аккаунта. Оттуда оно берётся при каждой рассылке."""
+    if not await is_connected():
+        return False
+    bio = io.BytesIO()
+    await bot.download(photo_size, destination=bio)
+    bio.seek(0)
+    bio.name = "mailing.jpg"
+    msg = await tg.send_file("me", bio, caption=PHOTO_TAG, silent=True, force_document=False)
+    old = cfg.get("photo_msg_id")
+    cfg["photo_msg_id"] = msg.id
+    save_cfg()
+    if old:
+        with suppress(Exception):
+            await tg.delete_messages("me", [old])
+    return True
+
+
+async def remove_photo() -> None:
+    old = cfg.get("photo_msg_id")
+    cfg["photo_msg_id"] = None
+    save_cfg()
+    if old:
+        with suppress(Exception):
+            await tg.delete_messages("me", [old])
+
+
+async def get_photo():
+    """Сообщение с фото из «Избранного» или None."""
+    pid = cfg.get("photo_msg_id")
+    if not pid:
+        return None
+    try:
+        m = await tg.get_messages("me", ids=pid)
+    except Exception:  # noqa: BLE001
+        return None
+    return m if m and m.media else None
+
+
+# ============================== АВТОПОДПИСКА ==============================
+URL_RE = re.compile(r"(?:https?://)?(?:t|telegram)\.me/(\+[\w-]+|joinchat/[\w-]+|[A-Za-z]\w{3,31})", re.I)
+MENTION_RE = re.compile(r"(?<![\w/@.])@([A-Za-z]\w{3,31})")
+RESERVED = {"joinchat", "addstickers", "addemoji", "share", "proxy", "socks", "setlanguage",
+            "iv", "login", "boost", "addlist", "giftcode", "username"}
+SUB_RE = re.compile(r"подпиш|подписк|вступ|join|subscri|канал|channel", re.I)
+CHECK_RE = re.compile(r"провер|подписал|готов|выполн|check|done|subscribed|joined|продолж|continue", re.I)
+
+_join_lock = asyncio.Lock()
+_join_times: list = []      # время успешных вступлений (для суточного лимита)
+_joined_tags: set = set()   # куда уже вступили в этом запуске
+
+
+async def extract_targets(msg):
+    """Достаёт из сообщения бота ссылки/@юзернеймы каналов (текст, ссылки в тексте, URL-кнопки).
+    Возвращает (список тегов, плоский список кнопок)."""
+    buttons = []
+    with suppress(Exception):
+        buttons = [b for row in (await msg.get_buttons() or []) for b in row]
+    chunks = [msg.raw_text or ""]
+    with suppress(Exception):
+        for ent, _txt in msg.get_entities_text():
+            url = getattr(ent, "url", None)
+            if url:
+                chunks.append(url)
+    chunks += [b.url for b in buttons if getattr(b, "url", None)]
+    blob = "\n".join(chunks)
+
+    tags, seen = [], set()
+    for t in URL_RE.findall(blob) + MENTION_RE.findall(blob):
+        key = t.lower()
+        if not t.startswith(("+", "joinchat/")) and (key in RESERVED or key.endswith("bot")):
+            continue   # служебные пути и боты пропускаем
+        if key not in seen:
+            seen.add(key)
+            tags.append(t)
+    return tags, buttons
+
+
+async def join_target(tag: str):
+    """Вступает в канал/группу. Возвращает (статус, пояснение); статус: joined / already / fail / flood / skip."""
+    try:
+        if tag.startswith(("+", "joinchat/")):
+            await asyncio.sleep(random.uniform(*JOIN_PAUSE))
+            await tg(ImportChatInviteRequest(tag.split("/")[-1].lstrip("+")))
+        else:
+            ent = await tg.get_entity(tag)
+            if not isinstance(ent, (Channel, Chat)):
+                return "skip", "это пользователь/бот, не канал"   # напр. @username того, к кому обратился бот
+            await asyncio.sleep(random.uniform(*JOIN_PAUSE))
+            await tg(JoinChannelRequest(ent))
+        return "joined", "вступил"
+    except errors.UserAlreadyParticipantError:
+        return "already", "уже подписан"
+    except errors.InviteRequestSentError:
+        return "fail", "нужна заявка - она отправлена, ждите одобрения"
+    except errors.FloodWaitError as e:
+        return "flood", f"FloodWait {e.seconds}с"
+    except errors.ChannelsTooMuchError:
+        return "fail", "достигнут лимит каналов на аккаунте"
+    except (errors.InviteHashExpiredError, errors.InviteHashInvalidError):
+        return "fail", "ссылка-приглашение недействительна"
+    except (errors.UsernameNotOccupiedError, errors.UsernameInvalidError):
+        return "fail", "такого юзернейма нет"
+    except errors.RPCError as e:
+        return "fail", type(e).__name__
+    except Exception as e:  # noqa: BLE001
+        return "fail", str(e)[:80]
+
+
+async def _autosub(bot: Bot, event) -> None:
+    if not cfg.get("autosub") or not event.is_group:
+        return
+    cid = str(event.chat_id)
+    if cid not in cfg["selected"]:          # только чаты из вашей рассылки
+        return
+    sender = await event.get_sender()
+    if not getattr(sender, "bot", False):   # только сообщения ботов
+        return
+    msg = event.message
+
+    if AUTOSUB_ONLY_ADDRESSED and not msg.mentioned:
+        reply = await msg.get_reply_message() if msg.is_reply else None
+        if not (reply and reply.out):
+            return
+
+    tags, buttons = await extract_targets(msg)
+    if not tags:
+        return
+    if not SUB_RE.search((msg.raw_text or "") + " " + " ".join(b.text for b in buttons)):
+        return
+
+    results, ok_any = [], False
+    async with _join_lock:
+        for tag in tags:
+            key = tag.lower()
+            if key in _joined_tags:
+                ok_any = True
+                continue
+            now = time.time()
+            _join_times[:] = [t for t in _join_times if now - t < 86400]
+            if len(_join_times) >= MAX_JOINS_PER_DAY:
+                results.append(f"• {html.escape(tag)}: суточный лимит {MAX_JOINS_PER_DAY} вступлений исчерпан")
+                break
+            status, info = await join_target(tag)
+            if status == "skip":
+                continue
+            if status in ("joined", "already"):
+                ok_any = True
+                _joined_tags.add(key)
+                if status == "joined":
+                    _join_times.append(time.time())
+            results.append(f"• {html.escape(tag)}: {html.escape(info)}")
+            if status == "flood":
+                break
+
+    # после подписки нажимаем кнопку «Проверить / Я подписался», если она есть
+    clicked = ""
+    if ok_any:
+        await asyncio.sleep(random.uniform(3, 6))
+        for b in buttons:
+            if getattr(b, "data", None) and CHECK_RE.search(b.text or ""):
+                try:
+                    await b.click()
+                    clicked = f"\nНажал кнопку: {html.escape(b.text)}"
+                except Exception as e:  # noqa: BLE001
+                    clicked = f"\nКнопку «{html.escape(b.text)}» нажать не удалось: {html.escape(str(e)[:80])}"
+                break
+
+    if results or clicked:
+        name = html.escape(cfg["chats"].get(cid, cid))
+        await notify(bot, f"🔔 Автоподписка (чат «{name}»):\n" + "\n".join(results) + clicked)
+
+
+async def on_group_message(bot: Bot, event) -> None:
+    try:
+        await _autosub(bot, event)
+    except Exception as e:  # noqa: BLE001
+        print("Автоподписка, ошибка:", e)
+
+
 # ============================== РАССЫЛКА ==============================
 class Mailer:
     task: asyncio.Task | None = None
@@ -329,17 +527,29 @@ class Mailer:
             cfg["done"] = 0
             save_cfg()
 
+    @staticmethod
+    async def _deliver(chat: int, photo) -> None:
+        text = cfg["text"]
+        if photo is None:
+            await tg.send_message(chat, text, parse_mode="html", link_preview=False)
+        elif text and len(cfg["text_plain"]) <= CAPTION_LIMIT:
+            await tg.send_file(chat, photo.media, caption=text, parse_mode="html")
+        else:
+            await tg.send_file(chat, photo.media)
+            if text:
+                await tg.send_message(chat, text, parse_mode="html", link_preview=False)
+
     @classmethod
-    async def _send(cls, bot: Bot, cid: str, retry: bool = True):
+    async def _send(cls, bot: Bot, cid: str, photo=None, retry: bool = True):
         """None = успех, иначе строка с причиной ошибки."""
         try:
-            await tg.send_message(int(cid), cfg["text"], parse_mode="html", link_preview=False)
+            await cls._deliver(int(cid), photo)
             return None
         except errors.FloodWaitError as e:
             if e.seconds > 600 or not retry:
                 return f"FloodWait {e.seconds}с - пропуск"
             await asyncio.sleep(e.seconds + 1)
-            return await cls._send(bot, cid, False)
+            return await cls._send(bot, cid, photo, False)
         except errors.SlowModeWaitError as e:
             return f"медленный режим ({e.seconds}с)"
         except errors.PeerFloodError:
@@ -350,7 +560,7 @@ class Mailer:
             await notify(bot, ("✅ Ограничений нет." if ok else "❌ Снять не удалось.")
                          + "\n\n" + html.escape("\n".join(log)))
             await asyncio.sleep(30)
-            return await cls._send(bot, cid, False)
+            return await cls._send(bot, cid, photo, False)
         except errors.RPCError as e:
             return type(e).__name__
         except Exception as e:  # noqa: BLE001
@@ -365,8 +575,15 @@ class Mailer:
                 t0 = time.time()
                 errs = []
                 targets = list(cfg["selected"])
+                photo = await get_photo()
+                if photo is None and cfg.get("photo_msg_id"):
+                    if not cfg["text"]:
+                        raise RuntimeError("фото не найдено в «Избранном», а текста нет")
+                    if not s.get("photo_warned"):
+                        s["photo_warned"] = True
+                        await notify(bot, "⚠️ Фото не найдено в «Избранном» - шлю только текст. Загрузите фото заново.")
                 for i, cid in enumerate(targets):
-                    err = await cls._send(bot, cid)
+                    err = await cls._send(bot, cid, photo)
                     if err is None:
                         s["sent"] += 1
                     else:
@@ -432,19 +649,25 @@ async def main_menu():
 
 def settings_view():
     prev = html.escape(cfg["text_plain"][:200]) or "— не задан —"
+    has_photo = bool(cfg.get("photo_msg_id"))
+    sub_on = bool(cfg.get("autosub"))
     text = (
         "<b>Настройка рассылки</b>\n\n"
         f"💬 Чатов выбрано: <b>{len(cfg['selected'])}</b> из {len(cfg['chats'])}\n"
         f"📝 Текст: {prev}\n"
+        f"🖼 Фото: <b>{'есть' if has_photo else 'нет'}</b>\n"
         f"⏱ Интервал между раундами: <b>{fmt_duration(cfg['interval'])}</b>\n"
         f"🔁 Повторов (раундов): <b>{cfg['count'] or '∞'}</b>\n"
-        f"⏳ Пауза между чатами: <b>{fmt_duration(cfg['chat_pause'])}</b>"
+        f"⏳ Пауза между чатами: <b>{fmt_duration(cfg['chat_pause'])}</b>\n"
+        f"🔔 Автоподписка на каналы из чатов: <b>{'вкл' if sub_on else 'выкл'}</b>"
     )
     kb = kb_of([
         [("💬 Выбор чатов", "ch:p:0")],
         [("📝 Текст", "set:text")],
+        [("🖼 Фото", "set:photo")] + ([("🗑 Убрать фото", "del:photo")] if has_photo else []),
         [("⏱ Интервал", "set:interval"), ("🔁 Повторы", "set:count")],
         [("⏳ Пауза между чатами", "set:pause")],
+        [(f"🔔 Автоподписка: {'ВКЛ' if sub_on else 'ВЫКЛ'}", "toggle:autosub")],
         [("◀️ Назад", "menu")],
     ])
     return text, kb
@@ -638,6 +861,30 @@ async def cb_set_text(cb: CallbackQuery, state: FSMContext):
     await ask(cb, state, Form.text, "Отправьте текст рассылки. Форматирование (жирный, курсив, ссылки) сохранится.")
 
 
+@router.callback_query(F.data == "set:photo")
+async def cb_set_photo(cb: CallbackQuery, state: FSMContext):
+    await ask(cb, state, Form.photo,
+              "Отправьте фото для рассылки (именно как фото, не файлом). "
+              "Текст рассылки уйдёт подписью к нему.")
+
+
+@router.callback_query(F.data == "del:photo")
+async def cb_del_photo(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await remove_photo()
+    text, kb = settings_view()
+    await show(cb, text, kb)
+
+
+@router.callback_query(F.data == "toggle:autosub")
+async def cb_toggle_autosub(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    cfg["autosub"] = not cfg.get("autosub")
+    save_cfg()
+    text, kb = settings_view()
+    await show(cb, text, kb)
+
+
 @router.callback_query(F.data == "set:interval")
 async def cb_set_interval(cb: CallbackQuery, state: FSMContext):
     await ask(cb, state, Form.interval,
@@ -663,12 +910,32 @@ async def back_to_settings(m: Message, state: FSMContext):
 
 @router.message(Form.text)
 async def st_text(m: Message, state: FSMContext):
+    if m.photo:   # фото с подписью: ставим и фото, и текст (если подпись есть)
+        if not await upload_photo(m.bot, m.photo[-1]):
+            return await m.answer("Не удалось загрузить фото. Проверьте, что аккаунт подключен.")
+        if m.caption:
+            cfg["text"] = m.html_text
+            cfg["text_plain"] = m.caption
+            save_cfg()
+        return await back_to_settings(m, state)
     if not m.text:
-        return await m.answer("Нужно текстовое сообщение.")
+        return await m.answer("Нужно текстовое сообщение (или фото с подписью).")
     cfg["text"] = m.html_text
     cfg["text_plain"] = m.text
     save_cfg()
     await back_to_settings(m, state)
+
+
+@router.message(Form.photo, F.photo)
+async def st_photo(m: Message, state: FSMContext):
+    if not await upload_photo(m.bot, m.photo[-1]):
+        return await m.answer("Не удалось загрузить фото. Проверьте, что аккаунт подключен.")
+    await back_to_settings(m, state)
+
+
+@router.message(Form.photo)
+async def st_photo_bad(m: Message):
+    await m.answer("Нужно именно фото (не файл и не текст). Отправьте картинку ещё раз.")
 
 
 @router.message(Form.interval)
@@ -707,8 +974,8 @@ async def cb_run(cb: CallbackQuery):
         return await go_menu(cb)
     if not cfg["selected"]:
         return await cb.answer("Сначала выберите чаты", show_alert=True)
-    if not cfg["text"]:
-        return await cb.answer("Сначала задайте текст", show_alert=True)
+    if not cfg["text"] and not cfg.get("photo_msg_id"):
+        return await cb.answer("Сначала задайте текст или фото", show_alert=True)
     Mailer.start(cb.bot)
     await go_menu(cb)
 
@@ -777,12 +1044,13 @@ async def main():
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
+    tg.add_event_handler(partial(on_group_message, bot), events.NewMessage(incoming=True))
 
     await tg.connect()
     if await tg.is_user_authorized():
         await remote_load()
         await scan_chats()
-        want = cfg.get("running") and cfg["selected"] and cfg["text"]
+        want = cfg.get("running") and cfg["selected"] and (cfg["text"] or cfg.get("photo_msg_id"))
         if want and not (cfg["count"] and cfg.get("done", 0) >= cfg["count"]):
             Mailer.start(bot, resume=True)
             await notify(bot, f"♻️ Сервис перезапущен, рассылка продолжена (выполнено раундов: {cfg.get('done', 0)}).")
